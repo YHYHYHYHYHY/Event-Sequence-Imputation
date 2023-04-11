@@ -14,6 +14,8 @@ class Exp():
         self.args = args
         self.model = PILES(args).to(self.args.device)
         self.device = args.device
+        self.factor_match = 0.25 # 时间距离转换系数，移动互相match的event的cost=self.factor_match * dis
+        self.factor_mismatch = 0.75 # 时间距离转换系数，移动互相不match的event的cost=self.factor_mismatch * dis
 
 
     def _getdata(self, data_dir):
@@ -41,6 +43,60 @@ class Exp():
                 seq[fin - j] = st
         return x
 
+    def _loss(self, seq_batch, seq_rev_batch):
+
+        batch_num = seq_batch.shape[0]
+        loss = torch.tensor(0.0).to(self.device)
+        for i in range(batch_num):
+            seq = seq_batch[i]
+            seq_rev = seq_rev_batch[i]
+            seq_len = 0
+            seq_rev_len = 0
+            while 1:
+                if seq[seq_len][1] < 0:
+                    break
+                seq_len += 1
+            while 1:
+                if seq_rev[seq_rev_len][1] < 0:
+                    break
+                seq_rev_len += 1
+            dp = torch.zeros((seq_len, seq_rev_len)).to(self.device)
+            # 明天重构...
+            def match(j, k):
+                if seq[j][1] == seq_rev[seq_rev_len-k-1][1]:
+                    return torch.abs(seq[j][0] - seq_rev[seq_rev_len-k-1][0]) * self.factor_match
+                else:
+                    return torch.abs(seq[j][0] - seq_rev[seq_rev_len - k - 1][0]) * self.factor_mismatch
+            dp[0][0] = match(0, 0)
+            for j in range(1, seq_rev_len):
+                dp[0][j] = torch.min(
+                    torch.stack((match(0, j) + j - 1, dp[0][j-1] + 1))
+                )
+            for j in range(1, seq_len):
+                dp[j][0] = torch.min(
+                    torch.stack((match(j, 0) + j - 1, dp[j-1][0] + 1))
+                )
+            for j in range(1, seq_len):
+                for k in range(1, seq_rev_len):
+                    dp[j][k] = torch.min(
+                        torch.stack(
+                            (dp[j-1][k-1] + match(j, k), torch.min(torch.stack((dp[j-1][k] + 1, dp[j][k-1] + 1))))
+                        )
+                    )
+            loss += dp[seq_len-1][seq_rev_len-1]
+            dp.to("cpu")
+            torch.cuda.empty_cache()
+
+        return loss
+
+
+
+
+
+
+
+
+
 
     def train(self, data_dir):
         train_loader, _, _, _ = self._getdata(data_dir)
@@ -66,10 +122,10 @@ class Exp():
 
                 outputs = self.model(batch_x)
                 outputs_rev = self.model(batch_x_reverse)
-                loss = (outputs + outputs_rev).sum()
+                loss = self._loss(outputs, outputs_rev)
                 train_loss.append(loss.item())
 
-                if (i + 1) % 100 == 0:
+                if (i + 1) % 1 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
